@@ -1,0 +1,193 @@
+"""
+Advanced Thinking Agent - Aage ki saari chats bhi auto
+Har user ki memory rakhega, soch ke reply dega
+"""
+import os
+from datetime import datetime
+
+class ConversationManager:
+    def __init__(self):
+        # User ID -> chat history
+        # Free me memory me, production me Redis / Google Sheet use karna
+        self.conversations = {}
+    
+    def get_history(self, user_id):
+        return self.conversations.get(user_id, [])
+    
+    def add_message(self, user_id, role, text):
+        if user_id not in self.conversations:
+            self.conversations[user_id] = []
+        
+        self.conversations[user_id].append({
+            "role": role,
+            "text": text,
+            "time": datetime.now().isoformat()
+        })
+        # Last 10 messages hi rakho, zyada bada na ho
+        if len(self.conversations[user_id]) > 10:
+            self.conversations[user_id] = self.conversations[user_id][-10:]
+    
+    def get_user_stage(self, user_id):
+        """User kis stage pe hai - CARD pucha, details di, ya link manga"""
+        history = self.get_history(user_id)
+        if not history:
+            return "NEW"
+        
+        # Simple logic se stage nikal lo
+        all_text = " ".join([h["text"] for h in history]).upper()
+        
+        if "SALARY" in all_text or "INCOME" in all_text or "CIBIL" in all_text:
+            return "QUALIFIED"
+        if "CARD" in all_text or "LOAN" in all_text:
+            return "INTERESTED"
+        if "LINK" in all_text:
+            return "LINK_SENT"
+        return "NEW"
+
+
+class ThinkingAgent:
+    def __init__(self):
+        self.conv_manager = ConversationManager()
+        
+        # Ye prompt hi iska dimaag hai - isko Claude me daal dega toh khud sochega
+        self.SYSTEM_PROMPT = """
+        Tu Shiva Adda ka Financial Advisor hai, naam hai Raj.
+        
+        TERA KAAM:
+        - User financial product ke baare me puch raha hai - Card, Loan, Account, Demat
+        - Tujhe salesman nahi, dost jaisa behave karna hai
+        - User ki thinking samajhni hai - usko darr hai, confusion hai, ya jaldi hai
+        
+        TERA SOCHNE KA TARIKA (Chain of Thought):
+        1. User abhi kya soch raha hai? Uska intent kya hai? (jaise - CIBIL kam hai toh darega)
+        2. Usne pehle kya bola tha? History dekh
+        3. Ab kya puchna chahiye taaki usko sahi product de saku?
+        4. Koi promise mat kar jo bank bhi nahi karta
+        
+        STAGES:
+        - NEW: Pehli baar aaya, keyword bola -> Welcome + 1 sawal puch
+        - INTERESTED: Product me interest hai -> Qualification puch (Age, City, Salary/CIBIL)
+        - QUALIFIED: Details de di -> Best 2 options bata + Link de
+        - LINK_SENT: Link bhej diya -> Follow up: "Apply hua? Koi error aaya?"
+        
+        RULES:
+        - Har reply 2-3 line se zyada lamba mat kar, Hinglish me bol
+        - Har reply me Banksathi link tabhi de jab user qualified ho jaye
+        - Kabhi bhi "100% approve" mat bol, hamesha "bank pe depend karta hai" bol
+        - Har 2nd reply me halka Mahadev ka touch de de - "Mahadev kripa se ho jayega"
+        
+        BANKSATHI LINKS:
+        CARD: {card_link}
+        LOAN: {loan_link}
+        ACCOUNT: {account_link}
+        
+        Example Thinking:
+        User: "Mera CIBIL 650 hai card milega?"
+        Your Thought: User ka CIBIL kam hai, dar raha hai. Isko secured card ya FD wala card dena chahiye, normal wala reject ho jayega. Pehle puch leta hu uske paas FD hai kya.
+        Your Reply: "650 pe normal wala mushkil hai bhai, par FD wala card 100% mil jayega. FD hai tere paas? DM me bata"
+        """
+
+    def think_and_reply(self, user_id, user_message, links):
+        # 1. History save karo
+        self.conv_manager.add_message(user_id, "user", user_message)
+        history = self.conv_manager.get_history(user_id)
+        stage = self.conv_manager.get_user_stage(user_id)
+        
+        print(f"User {user_id} Stage: {stage}, Message: {user_message}")
+        
+        # 2. Context banao Claude ke liye
+        history_text = "\n".join([f"{h['role']}: {h['text']}" for h in history[-6:]])
+        
+        # 3. Agar Claude API hai toh waha se soch ke reply lelo - FREE ke liye Groq/Gemini
+        ai_reply = self._call_claude_api(history_text, stage, user_message, links)
+        
+        if not ai_reply:
+            # Fallback - agar API nahi hai toh rule based reply
+            ai_reply = self._rule_based_thinking_reply(stage, user_message, links)
+        
+        # 4. Apna reply bhi history me save karo
+        self.conv_manager.add_message(user_id, "assistant", ai_reply)
+        
+        return ai_reply
+
+    def _call_claude_api(self, history_text, stage, user_message, links):
+        """Claude se thinking wala reply"""
+        try:
+            import anthropic
+            api_key = os.getenv("CLAUDE_API_KEY")
+            if not api_key:
+                return None
+                
+            client = anthropic.Anthropic(api_key=api_key)
+            
+            prompt = self.SYSTEM_PROMPT.format(
+                card_link=links.get("CARD", ""),
+                loan_link=links.get("LOAN", ""),
+                account_link=links.get("ACCOUNT", "")
+            )
+            
+            full_query = f"""
+            Chat History:
+            {history_text}
+            
+            Current Stage: {stage}
+            User ka abhi ka message: {user_message}
+            
+            Pehle soch (Thinking): User kya soch raha hai, uska dar kya hai?
+            Fir final reply de (Reply): 2-3 line, Hinglish
+            Format:
+            THINKING: [tera analysis]
+            REPLY: [jo user ko bhejna hai]
+            """
+            
+            response = client.messages.create(
+                model="claude-3-haiku-20240307",
+                max_tokens=400,
+                system=prompt,
+                messages=[{"role": "user", "content": full_query}]
+            )
+            
+            text = response.content[0].text
+            
+            # THINKING aur REPLY alag karo
+            if "REPLY:" in text:
+                reply = text.split("REPLY:")[1].strip()
+            else:
+                reply = text
+            
+            print(f"Claude Thinking: {text[:200]}...")
+            return reply
+            
+        except Exception as e:
+            print(f"Claude API Error: {e}")
+            return None
+
+    def _rule_based_thinking_reply(self, stage, user_message, links):
+        """Bina API ke bhi kaam chal jaye - Rule based thinking"""
+        msg = user_message.upper()
+        
+        # CIBIL kam ka dar
+        if "CIBIL" in msg and any(x in msg for x in ["650", "600", "LOW", "KAM"]):
+            return "650 pe normal wala thoda mushkil hai bhai, par tension nahi. FD wala card 100% mil jayega. Tere paas 10k ki FD hai? Bata toh usi ka link bhej du 🔱"
+        
+        # Salary kam
+        if "SALARY" in msg and any(x in msg for x in ["15K", "20K", "KAM"]):
+            return f"15-20k pe bhi 2 cards mil jayenge, limit kam ayegi bas. Ye wala try kar - {links.get('CARD','link')} - isme salary ka issue kam hai. Har Har Mahadev 🙏"
+        
+        # Stage wise
+        if stage == "NEW":
+            return "Har Har Mahadev 🙏 Bata kya chahiye - CARD, LOAN ya ACCOUNT? Ek bata, main best wala nikalwata hu."
+        
+        if stage == "INTERESTED":
+            if "CARD" in msg:
+                return "Card ke liye 2 cheez bata de bhai - Age kitni hai aur CIBIL kitna hai? 700+ hai toh lifetime free wala bhejta hu 💳"
+            if "LOAN" in msg:
+                return "Loan ke liye city kaunsa hai aur kitna amount chahiye? Aur salary/Income kitni hai? Us hisab se link bhejta hu 💰"
+        
+        if stage == "QUALIFIED":
+            return f"Samajh gaya bhai, tere liye ye best hai. Link ye raha - {links.get('CARD') or links.get('LOAN')} - Apply kar de, koi error aaye toh screenshot bhej dena. Mahadev kripa se ho jayega 🔱"
+        
+        if stage == "LINK_SENT":
+            return "Link pe click hua? Koi OTP ya error aaya kya? Bata de main help kar deta hu. Apply ke baad 2 din me bank call karega."
+        
+        return "Haan bhai bolo, kya help chahiye? CARD, LOAN ya ACCOUNT? Seedha bol de 🔱"

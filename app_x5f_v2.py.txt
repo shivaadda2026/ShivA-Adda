@@ -1,0 +1,103 @@
+"""
+Shiva Adda V2 - Full Thinking Chatbot
+Har user ka dimaag padh ke reply dega
+"""
+from flask import Flask, request, jsonify
+import os
+from advanced_agent import ThinkingAgent
+from dotenv import load_dotenv
+import requests
+import time
+
+load_dotenv()
+
+app = Flask(__name__)
+agent = ThinkingAgent()
+
+IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN")
+IG_USER_ID = os.getenv("IG_USER_ID")
+
+BANKSATHI_LINKS = {
+    "CARD": os.getenv("BANKSATHI_CARD_LINK", "https://banksathi.com/card"),
+    "LOAN": os.getenv("BANKSATHI_LOAN_LINK", "https://banksathi.com/loan"),
+    "ACCOUNT": os.getenv("BANKSATHI_ACCOUNT_LINK", "https://banksathi.com/account"),
+    "DEMAT": os.getenv("BANKSATHI_DEMAT_LINK", "https://banksathi.com/demat")
+}
+
+def send_dm(user_id, text):
+    url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/messages"
+    payload = {
+        "recipient": {"id": user_id},
+        "message": {"text": text},
+        "access_token": IG_ACCESS_TOKEN
+    }
+    try:
+        r = requests.post(url, json=payload)
+        print(f"DM to {user_id}: {r.status_code} - {text[:50]}")
+        return True
+    except Exception as e:
+        print(f"DM Error {e}")
+        return False
+
+@app.route("/")
+def home():
+    return "Shiva Adda V2 Thinking Agent Live 🔱"
+
+@app.route("/webhook", methods=["GET"])
+def verify():
+    if request.args.get("hub.mode") == "subscribe":
+        return request.args.get("hub.challenge")
+    return "Fail", 403
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.json
+    print("Incoming:", data)
+    
+    try:
+        for entry in data.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                
+                # DM handling with thinking
+                if "messaging" in str(value).lower() or "messages" in value:
+                    msgs = value.get("messaging") or value.get("messages") or []
+                    # Handle both formats
+                    if isinstance(value.get("messaging"), list):
+                        msgs = value["messaging"]
+                    
+                    for m in msgs:
+                        sender = m.get("sender", {}).get("id") or m.get("from", {}).get("id")
+                        text = m.get("message", {}).get("text") or m.get("text", "")
+                        
+                        if not sender or not text or m.get("sender", {}).get("id") == IG_USER_ID:
+                            continue
+                        
+                        # Yahi pe thinking wala agent kaam karega
+                        reply = agent.think_and_reply(sender, text, BANKSATHI_LINKS)
+                        time.sleep(1)  # Human jaisa lagne ke liye delay
+                        send_dm(sender, reply)
+
+    except Exception as e:
+        print(f"Error: {e}")
+    
+    return jsonify({"ok": True}), 200
+
+# Test without Instagram - yaha se soch samjhega
+@app.route("/chat", methods=["POST"])
+def chat_test():
+    data = request.json
+    user_id = data.get("user_id", "test_user_1")
+    message = data.get("message", "")
+    
+    reply = agent.think_and_reply(user_id, message, BANKSATHI_LINKS)
+    history = agent.conv_manager.get_history(user_id)
+    
+    return jsonify({
+        "reply": reply,
+        "stage": agent.conv_manager.get_user_stage(user_id),
+        "history": history
+    })
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
